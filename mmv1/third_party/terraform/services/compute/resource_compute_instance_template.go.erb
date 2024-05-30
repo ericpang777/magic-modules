@@ -38,6 +38,7 @@ var (
 <% unless version == 'ga' -%>
 		"scheduling.0.max_run_duration",
 		"scheduling.0.maintenance_interval",
+		"scheduling.0.on_instance_stop_action",
 <% end -%>
 		"scheduling.0.local_ssd_recovery_timeout",
 	}
@@ -178,6 +179,15 @@ func ResourceComputeInstanceTemplate() *schema.Resource {
 							ForceNew:    true,
 							Computed:    true,
 							Description: `Indicates how many IOPS to provision for the disk. This sets the number of I/O operations per second that the disk can handle. Values must be between 10,000 and 120,000. For more details, see the [Extreme persistent disk documentation](https://cloud.google.com/compute/docs/disks/extreme-persistent-disk).`,
+						},
+
+						"resource_manager_tags": {
+							Type:         schema.TypeMap,
+							Optional:     true,
+							ForceNew:     true,
+							Elem:         &schema.Schema{Type: schema.TypeString},
+							Set:          schema.HashString,
+							Description:  `A map of resource manager tags. Resource manager tag keys and values have the same definition as resource manager tags. Keys must be in the format tagKeys/{tag_key_id}, and values are in the format tagValues/456. The field is ignored (both PUT & PATCH) when empty.`,
 						},
 
 						"source_image": {
@@ -422,7 +432,7 @@ Google Cloud KMS.`,
 							Description:      `The name of the subnetwork to attach this interface to. The subnetwork must exist in the same region this instance will be created in. Either network or subnetwork must be provided.`,
 						},
 
-						<% if version == 'beta' -%>
+						<% unless version == 'ga' -%>
 						"network_attachment": {
 							Type:             schema.TypeString,
 							Optional:         true,
@@ -616,6 +626,18 @@ Google Cloud KMS.`,
 				Description: `An instance template is a global resource that is not bound to a zone or a region. However, you can still specify some regional resources in an instance template, which restricts the template to the region where that resource resides. For example, a custom subnetwork resource is tied to a specific region. Defaults to the region of the Provider if no value is given.`,
 			},
 
+			"resource_manager_tags": {
+				Type:        schema.TypeMap,
+				Optional:    true,
+				ForceNew:    true,
+				Elem:        &schema.Schema{Type: schema.TypeString},
+				Set:         schema.HashString,
+				Description: `A map of resource manager tags.
+				Resource manager tag keys and values have the same definition as resource manager tags.
+				Keys must be in the format tagKeys/{tag_key_id}, and values are in the format tagValues/456.
+				The field is ignored (both PUT & PATCH) when empty.`,
+			},
+
 			"scheduling": {
 				Type:        schema.TypeList,
 				Optional:    true,
@@ -707,6 +729,24 @@ Must be from 0 to 315,576,000,000 inclusive.`,
 resolution. Durations less than one second are represented
 with a 0 seconds field and a positive nanos field. Must
 be from 0 to 999,999,999 inclusive.`,
+									},
+								},
+							},
+						},
+						"on_instance_stop_action": {
+							Type:        schema.TypeList,
+							Optional:    true,
+							MaxItems:    1,
+							ForceNew:    true,
+							Description: `Defines the behaviour for instances with the instance_termination_action.`,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"discard_local_ssd": {
+										Type:     schema.TypeBool,
+										Optional:    true,
+										Description: `If true, the contents of any attached Local SSD disks will be discarded.`,
+										Default:      false,
+										ForceNew:    true,
 									},
 								},
 							},
@@ -849,12 +889,32 @@ be from 0 to 999,999,999 inclusive.`,
 				Description: `The Confidential VM config being used by the instance. on_host_maintenance has to be set to TERMINATE or this will fail to create.`,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
+						<% if version == "ga" -%>
 						"enable_confidential_compute": {
 							Type:        schema.TypeBool,
 							Required:    true,
 							ForceNew:    true,
 							Description: `Defines whether the instance should have confidential compute enabled.`,
 						},
+						<% else -%>
+						"enable_confidential_compute": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							ForceNew:    true,
+							Description: `Defines whether the instance should have confidential compute enabled. Field will be deprecated in a future release.`,
+							AtLeastOneOf: []string{"confidential_instance_config.0.enable_confidential_compute", "confidential_instance_config.0.confidential_instance_type"},
+						},
+						"confidential_instance_type": {
+							Type:        schema.TypeString,
+							Optional:    true,
+							ForceNew:    true,
+							Description: `
+								Specifies which confidential computing technology to use.
+								This could be one of the following values: SEV, SEV_SNP.
+								If SEV_SNP, min_cpu_platform = "AMD Milan" is currently required.`,
+							AtLeastOneOf: []string{"confidential_instance_config.0.enable_confidential_compute", "confidential_instance_config.0.confidential_instance_type"},
+						},
+						<% end -%>
 					},
 				},
 			},
@@ -1187,7 +1247,9 @@ func buildDisks(d *schema.ResourceData, config *transport_tpg.Config) ([]*comput
 			if v, ok := d.GetOk(prefix + ".provisioned_iops"); ok {
 				disk.InitializeParams.ProvisionedIops = int64(v.(int))
 			}
-
+			if _, ok := d.GetOk(prefix + ".resource_manager_tags"); ok {
+				disk.InitializeParams.ResourceManagerTags = tpgresource.ExpandStringMap(d, prefix + ".resource_manager_tags")
+			}
 			disk.InitializeParams.Labels = tpgresource.ExpandStringMap(d, prefix+".labels")
 
 			if v, ok := d.GetOk(prefix + ".source_image"); ok {
@@ -1210,7 +1272,6 @@ func buildDisks(d *schema.ResourceData, config *transport_tpg.Config) ([]*comput
 					disk.InitializeParams.SourceImageEncryptionKey.KmsKeyServiceAccount = v.(string)
 				}
 			}
-
 
 			if v, ok := d.GetOk(prefix + ".source_snapshot"); ok {
 				disk.InitializeParams.SourceSnapshot = v.(string)
@@ -1354,6 +1415,10 @@ func resourceComputeInstanceTemplateCreate(d *schema.ResourceData, meta interfac
 		instanceProperties.Labels = tpgresource.ExpandEffectiveLabels(d)
 	}
 
+	if _, ok := d.GetOk("resource_manager_tags"); ok {
+		instanceProperties.ResourceManagerTags = tpgresource.ExpandStringMap(d, "resource_manager_tags")
+	}
+
 	var itName string
 	if v, ok := d.GetOk("name"); ok {
 		itName = v.(string)
@@ -1469,8 +1534,8 @@ func flattenDisk(disk *compute.AttachedDisk, configDisk map[string]any, defaultP
 		} else {
 			diskMap["disk_size_gb"] = disk.InitializeParams.DiskSizeGb
 		}
-
 		diskMap["resource_policies"] = disk.InitializeParams.ResourcePolicies
+		diskMap["resource_manager_tags"] = disk.InitializeParams.ResourceManagerTags
 	}
 
 	if disk.DiskEncryptionKey != nil {

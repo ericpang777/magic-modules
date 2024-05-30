@@ -13,6 +13,7 @@
 
 require 'provider/terraform_oics'
 require 'fileutils'
+require 'set'
 
 module Provider
   # Code generator for a library converting terraform state to gcp objects.
@@ -247,8 +248,6 @@ module Provider
                         'third_party/terraform/services/compute/image.go'],
                        ['converters/google/resources/services/compute/disk_type.go',
                         'third_party/terraform/services/compute/disk_type.go'],
-                       ['converters/google/resources/services/logging/extract.go',
-                        'third_party/terraform/services/logging/extract.go'],
                        ['converters/google/resources/services/kms/kms_utils.go',
                         'third_party/terraform/services/kms/kms_utils.go'],
                        ['converters/google/resources/services/sourcerepo/source_repo_utils.go',
@@ -306,7 +305,17 @@ module Provider
                        ['converters/google/convert.go',
                         'third_party/tgc/convert.go'],
                        ['converters/google/convert_test.go',
-                        'third_party/tgc/convert_test.go']
+                        'third_party/tgc/convert_test.go'],
+                       ['converters/google/resources/compute_instance_group.go',
+                        'third_party/tgc/compute_instance_group.go'],
+                       ['converters/google/resources/job.go',
+                        'third_party/tgc/job.go'],
+                       ['converters/google/resources/service_account_key.go',
+                        'third_party/tgc/service_account_key.go'],
+                       ['converters/google/resources/compute_target_pool.go',
+                        'third_party/tgc/compute_target_pool.go'],
+                       ['converters/google/resources/dataproc_cluster.go',
+                        'third_party/tgc/dataproc_cluster.go']
                      ])
     end
 

@@ -46,7 +46,7 @@ var (
 				Type: schema.TypeBool,
 				Optional: true,
 				Computed: true,
-				Description: `Whether master is accessbile via Google Compute Engine Public IP addresses.`,
+				Description: `Whether Kubernetes master is accessible via Google Compute Engine Public IPs.`,
 			},
 		},
 	}
@@ -80,6 +80,7 @@ var (
 		"addons_config.0.gke_backup_agent_config",
 		"addons_config.0.config_connector_config",
 		"addons_config.0.gcs_fuse_csi_driver_config",
+		"addons_config.0.stateful_ha_config",
 	<% unless version == 'ga' -%>
 		"addons_config.0.istio_config",
 		"addons_config.0.kalm_config",
@@ -97,6 +98,7 @@ var (
 	forceNewClusterNodeConfigFields = []string{
 		"labels",
 		"workload_metadata_config",
+		"resource_manager_tags",
 	}
 
 	suppressDiffForAutopilot = schema.SchemaDiffSuppressFunc(func(k, oldValue, newValue string, d *schema.ResourceData) bool {
@@ -146,6 +148,7 @@ func clusterSchemaNodePoolDefaults() *schema.Schema {
 					MaxItems:    1,
 					Elem: &schema.Resource{
 						Schema: map[string]*schema.Schema{
+							"containerd_config": schemaContainerdConfig(),
 <% unless version == 'ga' -%>
 							"gcfs_config": schemaGcfsConfig(false),
 <% end -%>
@@ -204,6 +207,7 @@ func ResourceContainerCluster() *schema.Resource {
 			containerClusterNetworkPolicyEmptyCustomizeDiff,
 			containerClusterSurgeSettingsCustomizeDiff,
 			containerClusterEnableK8sBetaApisCustomizeDiff,
+			containerClusterNodeVersionCustomizeDiff,
 		),
 
 		Timeouts: &schema.ResourceTimeout{
@@ -503,6 +507,23 @@ func ResourceContainerCluster() *schema.Resource {
 								},
 							},
 						},
+						"stateful_ha_config": {
+							Type:          schema.TypeList,
+							Optional:      true,
+							Computed:      true,
+							AtLeastOneOf:  addonsConfigKeys,
+							MaxItems:      1,
+							Description:   `The status of the Stateful HA addon, which provides automatic configurable failover for stateful applications. Defaults to disabled; set enabled = true to enable.`,
+							ConflictsWith: []string{"enable_autopilot"},
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"enabled": {
+										Type:     schema.TypeBool,
+										Required: true,
+									},
+								},
+							},
+						},
 					},
 				},
 			},
@@ -770,7 +791,6 @@ func ResourceContainerCluster() *schema.Resource {
 								},
 							},
 						},
-						<% unless version == 'ga' -%>
 						"autoscaling_profile": {
 							Type:             schema.TypeString,
 							Default:          "BALANCED",
@@ -779,7 +799,6 @@ func ResourceContainerCluster() *schema.Resource {
 							ValidateFunc:     validation.StringInSlice([]string{"BALANCED", "OPTIMIZE_UTILIZATION"}, false),
 							Description:      `Configuration options for the Autoscaling profile feature, which lets you choose whether the cluster autoscaler should optimize for resource utilization or resource availability when deciding to remove nodes from a cluster. Can be BALANCED or OPTIMIZE_UTILIZATION. Defaults to BALANCED.`,
 						},
-						<% end -%>
 					},
 				},
 			},
@@ -1170,9 +1189,9 @@ func ResourceContainerCluster() *schema.Resource {
 							Optional:    true,
 							Computed:    true,
 <% if version == "ga" -%>
-							Description: `GKE components exposing metrics. Valid values include SYSTEM_COMPONENTS, APISERVER, SCHEDULER, CONTROLLER_MANAGER, STORAGE, HPA, POD, DAEMONSET, DEPLOYMENT and STATEFULSET.`,
+							Description: `GKE components exposing metrics. Valid values include SYSTEM_COMPONENTS, APISERVER, SCHEDULER, CONTROLLER_MANAGER, STORAGE, HPA, POD, DAEMONSET, DEPLOYMENT, STATEFULSET, KUBELET and CADVISOR.`,
 <% else -%>
-							Description: `GKE components exposing metrics. Valid values include SYSTEM_COMPONENTS, APISERVER, SCHEDULER, CONTROLLER_MANAGER, STORAGE, HPA, POD, DAEMONSET, DEPLOYMENT, STATEFULSET and WORKLOADS.`,
+							Description: `GKE components exposing metrics. Valid values include SYSTEM_COMPONENTS, APISERVER, SCHEDULER, CONTROLLER_MANAGER, STORAGE, HPA, POD, DAEMONSET, DEPLOYMENT, STATEFULSET, WORKLOADS, KUBELET and CADVISOR.`,
 <% end -%>
 							Elem: &schema.Schema{
 								Type: schema.TypeString,
@@ -1198,7 +1217,7 @@ func ResourceContainerCluster() *schema.Resource {
 							Type:        schema.TypeList,
 							Optional:    true,
 							Computed:    true,
-							MaxItems:    2,
+							MaxItems:    1,
 							Description: `Configuration of Advanced Datapath Observability features.`,
 							Elem: &schema.Resource{
 								Schema: map[string]*schema.Schema{
@@ -1207,12 +1226,21 @@ func ResourceContainerCluster() *schema.Resource {
 										Required:    true,
 										Description: `Whether or not the advanced datapath metrics are enabled.`,
 									},
+									"enable_relay": {
+										Type:          schema.TypeBool,
+										Optional:      true,
+										Description:   `Whether or not Relay is enabled.`,
+										Default:       false,
+										ConflictsWith: []string{"monitoring_config.0.advanced_datapath_observability_config.0.relay_mode"},
+									},
 									"relay_mode": {
-										Type:         schema.TypeString,
-										Optional:     true,
-										Computed:     true,
-										Description:  `Mode used to make Relay available.`,
-										ValidateFunc: validation.StringInSlice([]string{"DISABLED", "INTERNAL_VPC_LB", "EXTERNAL_LB"}, false),
+										Type:          schema.TypeString,
+										Optional:      true,
+										Computed:      true,
+										Deprecated:    "Deprecated in favor of enable_relay field. Remove this attribute's configuration as this field will be removed in the next major release and enable_relay will become a required field.",
+										Description:   `Mode used to make Relay available.`,
+										ValidateFunc:  validation.StringInSlice([]string{"DISABLED", "INTERNAL_VPC_LB", "EXTERNAL_LB"}, false),
+										ConflictsWith: []string{"monitoring_config.0.advanced_datapath_observability_config.0.enable_relay"},
 									},
 								},
 							},
@@ -1416,11 +1444,11 @@ func ResourceContainerCluster() *schema.Resource {
 			"node_pool_defaults": clusterSchemaNodePoolDefaults(),
 
 			"node_pool_auto_config": {
-				Type:             schema.TypeList,
-				Optional:         true,
-				Computed:         true,
-				MaxItems:         1,
-				Description:      `Node pool configs that apply to all auto-provisioned node pools in autopilot clusters and node auto-provisioning enabled clusters.`,
+				Type:        schema.TypeList,
+				Optional:    true,
+				Computed:    true,
+				MaxItems:    1,
+				Description: `Node pool configs that apply to all auto-provisioned node pools in autopilot clusters and node auto-provisioning enabled clusters.`,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"network_tags": {
@@ -1438,6 +1466,11 @@ func ResourceContainerCluster() *schema.Resource {
 									},
 								},
 							},
+						},
+						"resource_manager_tags": {
+							Type:        schema.TypeMap,
+							Optional:    true,
+							Description: `A map of resource manager tags. Resource manager tag keys and values have the same definition as resource manager tags. Keys must be in the format tagKeys/{tag_key_id}, and values are in the format tagValues/456. The field is ignored (both PUT & PATCH) when empty.`,
 						},
 					},
 				},
@@ -1675,7 +1708,7 @@ func ResourceContainerCluster() *schema.Resource {
 							Optional:     true,
 							ForceNew:     true,
 							AtLeastOneOf: privateClusterConfigKeys,
-							DiffSuppressFunc: tpgresource.CompareSelfLinkOrResourceName,
+							DiffSuppressFunc: containerClusterPrivateClusterConfigSuppress,
 							Description: `Subnetwork in cluster's network where master's endpoint will be provisioned.`,
 						},
 						"public_endpoint": {
@@ -1751,7 +1784,6 @@ func ResourceContainerCluster() *schema.Resource {
 				// workload_identity_config today.
 				Computed: true,
 				Description: `Configuration for the use of Kubernetes Service Accounts in GCP IAM policies.`,
-				ConflictsWith: []string{"enable_autopilot"},
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
 						"workload_pool": {
@@ -1791,7 +1823,7 @@ func ResourceContainerCluster() *schema.Resource {
 				"enabled": {
 					Type:        schema.TypeBool,
 					Required:    true,
-					Description: `When enabled, services with exterenal ips specified will be allowed.`,
+					Description: `When enabled, services with external ips specified will be allowed.`,
 				},
 			},
 		},
@@ -1911,7 +1943,12 @@ func ResourceContainerCluster() *schema.Resource {
 				ValidateFunc:     validation.StringInSlice([]string{"DATAPATH_PROVIDER_UNSPECIFIED", "LEGACY_DATAPATH", "ADVANCED_DATAPATH"}, false),
 				DiffSuppressFunc: tpgresource.EmptyOrDefaultStringSuppress("DATAPATH_PROVIDER_UNSPECIFIED"),
 			},
-
+			"enable_cilium_clusterwide_network_policy": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Description: `Whether Cilium cluster-wide network policy is enabled on this cluster.`,
+				Default:     false,
+			},
 			"enable_intranode_visibility": {
 			   Type: schema.TypeBool,
 			   Optional: true,
@@ -2005,11 +2042,17 @@ func ResourceContainerCluster() *schema.Resource {
 				Type:        schema.TypeList,
 				Optional:    true,
 				MaxItems:    1,
-				ForceNew:    true,
 				DiffSuppressFunc: suppressDiffForAutopilot,
 				Description: `Configuration for Cloud DNS for Kubernetes Engine.`,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
+						<% unless version == 'ga' -%>
+						"additive_vpc_scope_dns_domain": {
+							Type:         schema.TypeString,
+							Description:  `Enable additive VPC scope DNS in a GKE cluster.`,
+							Optional:     true,
+						},
+						<% end -%>
 						"cluster_dns": {
 							Type:         schema.TypeString,
 							Default:      "PROVIDER_UNSPECIFIED",
@@ -2062,19 +2105,47 @@ func ResourceContainerCluster() *schema.Resource {
 							Optional:          true,
 							Description:       `The Fleet host project of the cluster.`,
 						},
-                                          	"membership": {
-                                                	Type:             schema.TypeString,
-                                                	Computed:         true,
-                                                	Description:      `Full resource name of the registered fleet membership of the cluster.`,
-                                          	},
-                                          	"pre_registered": {
-                                                	Type:             schema.TypeBool,
-                                                	Computed:         true,
-                                                	Description:      `Whether the cluster has been registered via the fleet API.`,
-                                          	},
+						"membership": {
+							Type:             schema.TypeString,
+							Computed:         true,
+							Description:      `Full resource name of the registered fleet membership of the cluster.`,
+						},
+						"pre_registered": {
+							Type:             schema.TypeBool,
+							Computed:         true,
+							Description:      `Whether the cluster has been registered via the fleet API.`,
+						},
+						"membership_id": {
+							Type:             schema.TypeString,
+							Computed:         true,
+							Description:      `Short name of the fleet membership, for example "member-1".`,
+						},
+						"membership_location": {
+							Type:             schema.TypeString,
+							Computed:         true,
+							Description:      `Location of the fleet membership, for example "us-central1".`,
+						},
 					},
 				},
 			},
+			<% unless version == 'ga' -%>
+				"workload_alts_config": {
+					Type:             schema.TypeList,
+					Optional:         true,
+					Computed:         true,
+					MaxItems:         1,
+					Description:      `Configuration for direct-path (via ALTS) with workload identity.`,
+					Elem: &schema.Resource{
+							Schema: map[string]*schema.Schema{
+									"enable_alts": {
+											Type:          schema.TypeBool,
+											Required:      true,
+											Description:   `Whether the alts handshaker should be enabled or not for direct-path. Requires Workload Identity (workloadPool must be non-empty).`,
+									},
+							},
+					},
+				},
+				<% end -%>
 		},
 	}
 }
@@ -2216,16 +2287,17 @@ func resourceContainerClusterCreate(d *schema.ResourceData, meta interface{}) er
 <% end -%>
 		EnableTpu:               d.Get("enable_tpu").(bool),
 		NetworkConfig: &container.NetworkConfig{
-			EnableIntraNodeVisibility: d.Get("enable_intranode_visibility").(bool),
-			DefaultSnatStatus:         expandDefaultSnatStatus(d.Get("default_snat_status")),
-		    DatapathProvider:          d.Get("datapath_provider").(string),
-			PrivateIpv6GoogleAccess:   d.Get("private_ipv6_google_access").(string),
-			EnableL4ilbSubsetting:     d.Get("enable_l4_ilb_subsetting").(bool),
-			DnsConfig:                 expandDnsConfig(d.Get("dns_config")),
-			GatewayApiConfig:          expandGatewayApiConfig(d.Get("gateway_api_config")),
+			EnableIntraNodeVisibility:            d.Get("enable_intranode_visibility").(bool),
+			DefaultSnatStatus:                    expandDefaultSnatStatus(d.Get("default_snat_status")),
+			DatapathProvider:                     d.Get("datapath_provider").(string),
+			EnableCiliumClusterwideNetworkPolicy: d.Get("enable_cilium_clusterwide_network_policy").(bool),
+			PrivateIpv6GoogleAccess:              d.Get("private_ipv6_google_access").(string),
+			EnableL4ilbSubsetting:                d.Get("enable_l4_ilb_subsetting").(bool),
+			DnsConfig:                            expandDnsConfig(d.Get("dns_config")),
+			GatewayApiConfig:                     expandGatewayApiConfig(d.Get("gateway_api_config")),
 <% unless version == "ga" -%>
-			EnableMultiNetworking:     d.Get("enable_multi_networking").(bool),
-			EnableFqdnNetworkPolicy:   d.Get("enable_fqdn_network_policy").(bool),
+			EnableMultiNetworking:                d.Get("enable_multi_networking").(bool),
+			EnableFqdnNetworkPolicy:              d.Get("enable_fqdn_network_policy").(bool),
 <% end -%>
 	    },
 		MasterAuth:     expandMasterAuth(d.Get("master_auth")),
@@ -2384,12 +2456,35 @@ func resourceContainerClusterCreate(d *schema.ResourceData, meta interface{}) er
 		cluster.SecurityPostureConfig = expandSecurityPostureConfig(v)
 	}
 
+  needUpdateAfterCreate := false
+
 	// For now PSC based cluster don't support `enable_private_endpoint` on `create`, but only on `update` API call.
 	// If cluster is PSC based and enable_private_endpoint is set to true we will ignore it on `create` call and update cluster right after creation.
 	enablePrivateEndpointPSCCluster := isEnablePrivateEndpointPSCCluster(cluster)
 	if enablePrivateEndpointPSCCluster {
 		cluster.PrivateClusterConfig.EnablePrivateEndpoint = false
+		needUpdateAfterCreate = true
 	}
+
+	enablePDCSI := isEnablePDCSI(cluster);
+	if !enablePDCSI {
+		// GcePersistentDiskCsiDriver cannot be disabled at cluster create, only on cluster update. Ignore on create then update after creation.
+		// If pdcsi is disabled, the config should be defined. But we will be paranoid and double-check.
+		needUpdateAfterCreate = true
+		if cluster.AddonsConfig == nil {
+			cluster.AddonsConfig = &container.AddonsConfig{}
+		}
+		if cluster.AddonsConfig.GcePersistentDiskCsiDriverConfig == nil {
+			cluster.AddonsConfig.GcePersistentDiskCsiDriverConfig = &container.GcePersistentDiskCsiDriverConfig{}
+		}
+		cluster.AddonsConfig.GcePersistentDiskCsiDriverConfig.Enabled = true
+	}
+
+	<% unless version == 'ga' -%>
+	if v, ok := d.GetOk("workload_alts_config"); ok {
+		cluster.WorkloadAltsConfig = expandWorkloadAltsConfig(v)
+	}
+	<% end -%>
 
 	req := &container.CreateClusterRequest{
 		Cluster: cluster,
@@ -2475,14 +2570,22 @@ func resourceContainerClusterCreate(d *schema.ResourceData, meta interface{}) er
 		}
 	}
 
-	if enablePrivateEndpointPSCCluster {
+	if needUpdateAfterCreate {
 		name := containerClusterFullName(project, location, clusterName)
-		req := &container.UpdateClusterRequest{
-			Update: &container.ClusterUpdate{
-				DesiredEnablePrivateEndpoint: true,
-				ForceSendFields:              []string{"DesiredEnablePrivateEndpoint"},
-			},
+		update := &container.ClusterUpdate{}
+		if enablePrivateEndpointPSCCluster {
+			update.DesiredEnablePrivateEndpoint = true
+			update.ForceSendFields = append(update.ForceSendFields, "DesiredEnablePrivateEndpoint");
 		}
+		if !enablePDCSI {
+			update.DesiredAddonsConfig = &container.AddonsConfig{
+				GcePersistentDiskCsiDriverConfig: &container.GcePersistentDiskCsiDriverConfig{
+					Enabled: false,
+				},
+			}
+			update.ForceSendFields = append(update.ForceSendFields, "DesiredAddonsConfig.GcePersistentDiskCsiDriverConfig.Enabled");
+		}
+		req := &container.UpdateClusterRequest{Update: update}
 
 		err = transport_tpg.Retry(transport_tpg.RetryOptions{
 			RetryFunc: func() error {
@@ -2495,12 +2598,12 @@ func resourceContainerClusterCreate(d *schema.ResourceData, meta interface{}) er
 			},
 		})
 		if err != nil {
-			return errwrap.Wrapf("Error updating enable private endpoint: {{err}}", err)
+			return errwrap.Wrapf(fmt.Sprintf("Error updating cluster for %v: {{err}}", update.ForceSendFields), err)
 		}
 
 		err = ContainerOperationWait(config, op, project, location, "updating enable private endpoint", userAgent, d.Timeout(schema.TimeoutCreate))
 		if err != nil {
-			return errwrap.Wrapf("Error while waiting to enable private endpoint: {{err}}", err)
+			return errwrap.Wrapf(fmt.Sprintf("Error while waiting on cluster update for %v: {{err}}", update.ForceSendFields), err)
 		}
 	}
 
@@ -2723,6 +2826,9 @@ func resourceContainerClusterRead(d *schema.ResourceData, meta interface{}) erro
 	if err := d.Set("datapath_provider", cluster.NetworkConfig.DatapathProvider); err != nil {
 		return fmt.Errorf("Error setting datapath_provider: %s", err)
 	}
+	if err := d.Set("enable_cilium_clusterwide_network_policy", cluster.NetworkConfig.EnableCiliumClusterwideNetworkPolicy); err != nil {
+		return fmt.Errorf("Error setting enable_cilium_clusterwide_network_policy: %s", err)
+	}
 	if err := d.Set("default_snat_status", flattenDefaultSnatStatus(cluster.NetworkConfig.DefaultSnatStatus)); err != nil {
 		return err
 	}
@@ -2859,6 +2965,12 @@ func resourceContainerClusterRead(d *schema.ResourceData, meta interface{}) erro
 	}
 <% end -%>
 
+<% unless version == 'ga' -%>
+	if err := d.Set("workload_alts_config", flattenWorkloadAltsConfig(cluster.WorkloadAltsConfig)); err != nil {
+		return err
+	}
+<% end -%>
+
 	return nil
 }
 
@@ -2956,6 +3068,22 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 		log.Printf("[INFO] GKE cluster %s's cluster-wide autoscaling has been updated", d.Id())
 	}
 
+	if d.HasChange("dns_config") {
+		req := &container.UpdateClusterRequest{
+			Update: &container.ClusterUpdate{
+				DesiredDnsConfig: expandDnsConfig(d.Get("dns_config")),
+			},
+		}
+
+		updateF := updateFunc(req, "updating GKE cluster DNSConfig")
+		// Call update serially.
+		if err := transport_tpg.LockedCall(lockKey, updateF); err != nil {
+			return err
+		}
+
+		log.Printf("[INFO] GKE cluster %s's DNSConfig has been updated", d.Id())
+	}
+
 	if d.HasChange("allow_net_admin") {
 		allowed := d.Get("allow_net_admin").(bool)
 		req := &container.UpdateClusterRequest{
@@ -2973,26 +3101,6 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 	    }
 
 		log.Printf("[INFO] GKE cluster %s's autopilot workload policy config allow_net_admin has been set to %v", d.Id(), allowed)
-	}
-
-	if d.HasChange("enable_binary_authorization") {
-		enabled := d.Get("enable_binary_authorization").(bool)
-		req := &container.UpdateClusterRequest{
-			Update: &container.ClusterUpdate{
-				DesiredBinaryAuthorization: &container.BinaryAuthorization{
-					Enabled:         enabled,
-					ForceSendFields: []string{"Enabled"},
-				},
-			},
-		}
-
-		updateF := updateFunc(req, "updating GKE binary authorization")
-		// Call update serially.
-		if err := transport_tpg.LockedCall(lockKey, updateF); err != nil {
-			return err
-		}
-
-		log.Printf("[INFO] GKE cluster %s's binary authorization has been updated to %v", d.Id(), enabled)
 	}
 
 	if d.HasChange("private_cluster_config.0.enable_private_endpoint") {
@@ -3033,7 +3141,7 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 		log.Printf("[INFO] GKE cluster %s's master global access config has been updated to %v", d.Id(), config)
 	}
 
-    if d.HasChange("binary_authorization") {
+	if d.HasChange("binary_authorization") {
 		req := &container.UpdateClusterRequest{
 			Update: &container.ClusterUpdate{
 				DesiredBinaryAuthorization: expandBinaryAuthorization(d.Get("binary_authorization")),
@@ -3223,6 +3331,22 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 		log.Printf("[INFO] GKE cluster %s FQDN Network Policy has been updated to %v", d.Id(), enabled)
 	}
 <% end -%>
+
+	if d.HasChange("enable_cilium_clusterwide_network_policy") {
+		enabled := d.Get("enable_cilium_clusterwide_network_policy").(bool)
+		req := &container.UpdateClusterRequest{
+			Update: &container.ClusterUpdate{
+				DesiredEnableCiliumClusterwideNetworkPolicy: enabled,
+			},
+		}
+		updateF := updateFunc(req, "updating cilium clusterwide network policy")
+		// Call update serially.
+		if err := transport_tpg.LockedCall(lockKey, updateF); err != nil {
+			return err
+		}
+
+		log.Printf("[INFO] GKE cluster %s Cilium Clusterwide Network Policy has been updated to %v", d.Id(), enabled)
+	}
 
 	if d.HasChange("cost_management_config") {
 		c := d.Get("cost_management_config")
@@ -4072,6 +4196,21 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 		log.Printf("[INFO] GKE cluster %s Security Posture Config has been updated to %#v", d.Id(), req.Update.DesiredSecurityPostureConfig)
 	}
 
+	if d.HasChange("node_pool_defaults") && d.HasChange("node_pool_defaults.0.node_config_defaults.0.containerd_config") {
+		if v, ok := d.GetOk("node_pool_defaults.0.node_config_defaults.0.containerd_config"); ok {
+			req := &container.UpdateClusterRequest{
+				Update: &container.ClusterUpdate{
+					DesiredContainerdConfig: expandContainerdConfig(v),
+				},
+			}
+			updateF := updateFunc(req, "updating GKE cluster containerd config")
+			if err := transport_tpg.LockedCall(lockKey, updateF); err != nil {
+				return err
+			}
+			log.Printf("[INFO] GKE cluster %s containerd config has been updated to %#v", d.Id(), req.Update.DesiredContainerdConfig)
+		}
+	}
+
 	if d.HasChange("node_pool_auto_config.0.network_tags.0.tags") {
 		tags := d.Get("node_pool_auto_config.0.network_tags.0.tags").([]interface{})
 
@@ -4091,6 +4230,24 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 		}
 
 		log.Printf("[INFO] GKE cluster %s node pool auto config network tags have been updated", d.Id())
+	}
+
+	if d.HasChange("node_pool_auto_config.0.resource_manager_tags") {
+		rmtags := d.Get("node_pool_auto_config.0.resource_manager_tags")
+
+		req := &container.UpdateClusterRequest{
+			Update: &container.ClusterUpdate{
+				DesiredNodePoolAutoConfigResourceManagerTags: expandResourceManagerTags(rmtags),
+			},
+		}
+
+		updateF := updateFunc(req, "updating GKE cluster node pool auto config resource manager tags")
+		// Call update serially.
+		if err := transport_tpg.LockedCall(lockKey, updateF); err != nil {
+			return err
+		}
+
+		log.Printf("[INFO] GKE cluster %s node pool auto config resource manager tags have been updated", d.Id())
 	}
 
 	d.Partial(false)
@@ -4148,7 +4305,22 @@ func resourceContainerClusterUpdate(d *schema.ResourceData, meta interface{}) er
 		log.Printf("[INFO] GKE cluster %s Protect Config has been updated to %#v", d.Id(), req.Update.DesiredProtectConfig)
 	}
 <% end -%>
+<% unless version == 'ga' -%>
+	if d.HasChange("workload_alts_config") {
+		req := &container.UpdateClusterRequest{
+			Update: &container.ClusterUpdate{
+				DesiredWorkloadAltsConfig: expandWorkloadAltsConfig(d.Get("workload_alts_config")),
+			},
+		}
 
+		updateF := updateFunc(req, "updating GKE cluster WorkloadALTSConfig")
+		if err := transport_tpg.LockedCall(lockKey, updateF); err != nil {
+			return err
+		}
+
+		log.Printf("[INFO] GKE cluster %s's WorkloadALTSConfig has been updated", d.Id())
+	}
+<% end -%>
 	return resourceContainerClusterRead(d, meta)
 }
 
@@ -4346,6 +4518,14 @@ func expandClusterAddonsConfig(configured interface{}) *container.AddonsConfig {
 	if v, ok := config["gcs_fuse_csi_driver_config"]; ok && len(v.([]interface{})) > 0 {
 		addon := v.([]interface{})[0].(map[string]interface{})
 		ac.GcsFuseCsiDriverConfig = &container.GcsFuseCsiDriverConfig{
+			Enabled:         addon["enabled"].(bool),
+			ForceSendFields: []string{"Enabled"},
+		}
+	}
+
+	if v, ok := config["stateful_ha_config"]; ok && len(v.([]interface{})) > 0 {
+		addon := v.([]interface{})[0].(map[string]interface{})
+		ac.StatefulHaConfig = &container.StatefulHAConfig{
 			Enabled:         addon["enabled"].(bool),
 			ForceSendFields: []string{"Enabled"},
 		}
@@ -4558,9 +4738,7 @@ func expandClusterAutoscaling(configured interface{}, d *schema.ResourceData) *c
 	return &container.ClusterAutoscaling{
 		EnableNodeAutoprovisioning: config["enabled"].(bool),
 		ResourceLimits:             resourceLimits,
-		<% unless version == 'ga' -%>
 		AutoscalingProfile: config["autoscaling_profile"].(string),
-		<% end -%>
 		AutoprovisioningNodePoolDefaults: expandAutoProvisioningDefaults(config["auto_provisioning_defaults"], d),
 	}
 }
@@ -4935,6 +5113,13 @@ func isEnablePrivateEndpointPSCCluster(cluster *container.Cluster) bool {
 	return false
 }
 
+func isEnablePDCSI(cluster *container.Cluster) bool {
+	if cluster.AddonsConfig == nil || cluster.AddonsConfig.GcePersistentDiskCsiDriverConfig == nil {
+		return true;	// PDCSI is enabled by default.
+	}
+	return cluster.AddonsConfig.GcePersistentDiskCsiDriverConfig.Enabled
+}
+
 func expandPrivateClusterConfig(configured interface{}) *container.PrivateClusterConfig {
 	l := configured.([]interface{})
 	if len(l) == 0 {
@@ -5150,9 +5335,12 @@ func expandDnsConfig(configured interface{}) *container.DNSConfig {
 
 	config := l[0].(map[string]interface{})
 	return &container.DNSConfig{
-		ClusterDns:       config["cluster_dns"].(string),
-		ClusterDnsScope:  config["cluster_dns_scope"].(string),
-		ClusterDnsDomain: config["cluster_dns_domain"].(string),
+<% unless version == 'ga' -%>
+		AdditiveVpcScopeDnsDomain: 	config["additive_vpc_scope_dns_domain"].(string),
+<% end -%>
+		ClusterDns:       			config["cluster_dns"].(string),
+		ClusterDnsScope:  			config["cluster_dns_scope"].(string),
+		ClusterDnsDomain: 			config["cluster_dns_domain"].(string),
 	}
 }
 
@@ -5178,7 +5366,7 @@ func expandFleet(configured interface{}) *container.Fleet {
 	return &container.Fleet{
 		Project: config["project"].(string),
 	}
-}  
+}
 
 func expandEnableK8sBetaApis(configured interface{}, enabledAPIs []string) *container.K8sBetaAPIConfig {
 	l := configured.([]interface{})
@@ -5247,7 +5435,18 @@ func expandMonitoringConfig(configured interface{}) *container.MonitoringConfig 
 
 		mc.AdvancedDatapathObservabilityConfig = &container.AdvancedDatapathObservabilityConfig{
 			EnableMetrics: advanced_datapath_observability_config["enable_metrics"].(bool),
-			RelayMode: advanced_datapath_observability_config["relay_mode"].(string),
+		}
+
+		enable_relay := advanced_datapath_observability_config["enable_relay"].(bool)
+		relay_mode := advanced_datapath_observability_config["relay_mode"].(string)
+		if enable_relay {
+			mc.AdvancedDatapathObservabilityConfig.EnableRelay = enable_relay
+		} else if relay_mode == "INTERNAL_VPC_LB" || relay_mode == "EXTERNAL_LB" {
+			mc.AdvancedDatapathObservabilityConfig.RelayMode = relay_mode
+		} else {
+			mc.AdvancedDatapathObservabilityConfig.EnableRelay = enable_relay
+			mc.AdvancedDatapathObservabilityConfig.RelayMode = "DISABLED"
+			mc.AdvancedDatapathObservabilityConfig.ForceSendFields = []string{"EnableRelay"}
 		}
 	}
 
@@ -5325,6 +5524,11 @@ func expandNodePoolAutoConfig(configured interface{}) *container.NodePoolAutoCon
 	if v, ok := config["network_tags"]; ok && len(v.([]interface{})) > 0 {
 		npac.NetworkTags = expandNodePoolAutoConfigNetworkTags(v)
 	}
+
+	if v, ok := config["resource_manager_tags"]; ok && len(v.(map[string]interface{})) > 0 {
+		npac.ResourceManagerTags = expandResourceManagerTags(v)
+	}
+
 	return npac
 }
 
@@ -5341,6 +5545,21 @@ func expandNodePoolAutoConfigNetworkTags(configured interface{}) *container.Netw
 	}
 	return nt
 }
+
+<% unless version == 'ga' -%>
+func expandWorkloadAltsConfig(configured interface{}) *container.WorkloadALTSConfig {
+	l := configured.([]interface{})
+	if len(l) == 0 || l[0] == nil {
+		return nil
+	}
+
+	config := l[0].(map[string]interface{})
+	return &container.WorkloadALTSConfig{
+		EnableAlts:              config["enable_alts"].(bool),
+		ForceSendFields: []string{"EnableAlts"},
+	}
+}
+<% end -%>
 
 func flattenNotificationConfig(c *container.NotificationConfig) []map[string]interface{} {
 	if c == nil {
@@ -5490,6 +5709,13 @@ func flattenClusterAddonsConfig(c *container.AddonsConfig) []map[string]interfac
 			},
 		}
 	}
+	if c.StatefulHaConfig != nil {
+		result["stateful_ha_config"] = []map[string]interface{}{
+			{
+				"enabled": c.StatefulHaConfig.Enabled,
+			},
+		}
+	}
 
 <% unless version == 'ga' -%>
 	if c.IstioConfig != nil {
@@ -5509,6 +5735,7 @@ func flattenClusterAddonsConfig(c *container.AddonsConfig) []map[string]interfac
 		}
 	}
 <% end -%>
+
 	return []map[string]interface{}{result}
 }
 
@@ -5795,9 +6022,7 @@ func flattenClusterAutoscaling(a *container.ClusterAutoscaling) []map[string]int
 	} else {
 		r["enabled"] = false
 	}
-	<% unless version == 'ga' -%>
 	r["autoscaling_profile"] = a.AutoscalingProfile
-	<% end -%>
 
 	return []map[string]interface{}{r}
 }
@@ -5987,9 +6212,12 @@ func flattenDnsConfig(c *container.DNSConfig) []map[string]interface{} {
 	}
 	return []map[string]interface{}{
 		{
-			"cluster_dns":        c.ClusterDns,
-			"cluster_dns_scope":  c.ClusterDnsScope,
-			"cluster_dns_domain": c.ClusterDnsDomain,
+<% unless version == 'ga' -%>
+			"additive_vpc_scope_dns_domain": 	c.AdditiveVpcScopeDnsDomain,
+<% end -%>
+			"cluster_dns":        				c.ClusterDns,
+			"cluster_dns_scope":  				c.ClusterDnsScope,
+			"cluster_dns_domain": 				c.ClusterDnsDomain,
 		},
 	}
 }
@@ -6006,16 +6234,27 @@ func flattenGatewayApiConfig(c *container.GatewayAPIConfig) []map[string]interfa
 }
 
 func flattenFleet(c *container.Fleet) []map[string]interface{} {
-      if c == nil {
-                return nil
-      }         
-      return []map[string]interface{}{
-                {
-                      "project": c.Project,
-                      "membership": c.Membership,
-		      "pre_registered": c.PreRegistered,
-                },
-      }       
+	if c == nil {
+		return nil
+	}
+
+	// Parse membership_id and membership_location from full membership name.
+	var membership_id, membership_location string
+	membershipRE := regexp.MustCompile(`^(//[a-zA-Z0-9\.\-]+)?/?projects/([^/]+)/locations/([a-zA-Z0-9\-]+)/memberships/([^/]+)$`)
+	if match := membershipRE.FindStringSubmatch(c.Membership); match != nil {
+		membership_id = match[4]
+		membership_location = match[3]
+	}
+
+	return []map[string]interface{}{
+		{
+			"project": c.Project,
+			"membership": c.Membership,
+			"membership_id": membership_id,
+			"membership_location": membership_location,
+			"pre_registered": c.PreRegistered,
+		},
+	}
 }
 
 func flattenEnableK8sBetaApis(c *container.K8sBetaAPIConfig) []map[string]interface{} {
@@ -6061,10 +6300,33 @@ func flattenMonitoringConfig(c *container.MonitoringConfig) []map[string]interfa
 }
 
 func flattenAdvancedDatapathObservabilityConfig(c *container.AdvancedDatapathObservabilityConfig) []map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+
+	if c.EnableRelay {
+		return []map[string]interface{}{
+			{
+				"enable_metrics": c.EnableMetrics,
+				"enable_relay":   c.EnableRelay,
+			},
+		}
+	}
+
+	if c.RelayMode == "INTERNAL_VPC_LB" || c.RelayMode == "EXTERNAL_LB" {
+		return []map[string]interface{}{
+			{
+				"enable_metrics": c.EnableMetrics,
+				"relay_mode":     c.RelayMode,
+			},
+		}
+	}
+
 	return []map[string]interface{}{
 		{
 			"enable_metrics": c.EnableMetrics,
-			"relay_mode": 	 c.RelayMode,
+			"enable_relay":   false,
+			"relay_mode":     "DISABLED",
 		},
 	}
 }
@@ -6086,6 +6348,9 @@ func flattenNodePoolAutoConfig(c *container.NodePoolAutoConfig) []map[string]int
 	if c.NetworkTags != nil {
 		result["network_tags"] = flattenNodePoolAutoConfigNetworkTags(c.NetworkTags)
 	}
+	if c.ResourceManagerTags != nil {
+		result["resource_manager_tags"] = flattenResourceManagerTags(c.ResourceManagerTags)
+	}
 
 	return []map[string]interface{}{result}
 }
@@ -6101,6 +6366,19 @@ func flattenNodePoolAutoConfigNetworkTags(c *container.NetworkTags) []map[string
 	}
 	return []map[string]interface{}{result}
 }
+
+<% unless version == 'ga' -%>
+func flattenWorkloadAltsConfig(c *container.WorkloadALTSConfig) []map[string]interface{} {
+	if c == nil {
+		return nil
+	}
+	return []map[string]interface{}{
+		{
+			"enable_alts":        c.EnableAlts,
+		},
+	}
+}
+<% end -%>
 
 func resourceContainerClusterStateImporter(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
 	config := meta.(*transport_tpg.Config)
@@ -6226,6 +6504,14 @@ func containerClusterPrivateClusterConfigSuppress(k, old, new string, d *schema.
 		return suppressNodes && !hasSubnet
 	} else if k == "private_cluster_config.#" {
 		return suppressEndpoint && suppressNodes && !hasSubnet && !hasGlobalAccessConfig
+	} else if k == "private_cluster_config.0.private_endpoint_subnetwork" {
+		// Before regular compare, for the sake of private flexible cluster,
+		// suppress diffs in private_endpoint_subnetwork when
+		//   master_ipv4_cidr_block is set
+		//   && private_endpoint_subnetwork is unset in terraform (new value == "")
+		//   && private_endpoint_subnetwork is returned from resource (old value != "")
+		_, hasMasterCidr := d.GetOk("private_cluster_config.0.master_ipv4_cidr_block")
+		return (hasMasterCidr && new == "" && old != "") || tpgresource.CompareSelfLinkOrResourceName(k, old, new, d)
 	}
 	return false
 }
@@ -6382,6 +6668,35 @@ func containerClusterEnableK8sBetaApisCustomizeDiffFunc(d tpgresource.TerraformR
 				return d.ForceNew("enable_k8s_beta_apis.0.enabled_apis")
 			}
 		}
+	}
+
+	return nil
+}
+
+func containerClusterNodeVersionCustomizeDiff(_ context.Context,diff *schema.ResourceDiff, meta interface{}) error {
+	// separate func to allow unit testing
+	return containerClusterNodeVersionCustomizeDiffFunc(diff)
+}
+
+func containerClusterNodeVersionCustomizeDiffFunc(diff tpgresource.TerraformResourceDiff) error {
+	oldValueName, _ := diff.GetChange("name")
+	if oldValueName != "" {
+		return nil
+	}
+
+	_, newValueNode := diff.GetChange("node_version")
+	_, newValueMaster := diff.GetChange("min_master_version")
+
+	if newValueNode == "" || newValueMaster == "" {
+		return nil
+	}
+
+	//ignore -gke.X suffix for now. If it becomes a problem later, we can fix it
+	masterVersion := strings.Split(newValueMaster.(string), "-")[0]
+	nodeVersion := strings.Split(newValueNode.(string), "-")[0]
+
+	if masterVersion != nodeVersion {
+		return fmt.Errorf("Resource argument node_version (value: %s) must either be unset or set to the same value as min_master_version (value: %s) on create." , newValueNode, newValueMaster)
 	}
 
 	return nil

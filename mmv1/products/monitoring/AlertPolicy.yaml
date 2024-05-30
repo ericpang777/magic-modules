@@ -926,6 +926,7 @@ properties:
             name: period
             description: |
               Not more than one notification per period.
+              A duration in seconds with up to nine fractional digits, terminated by 's'. Example "60.5s".
       - !ruby/object:Api::Type::String
         name: autoClose
         description: |
@@ -957,6 +958,16 @@ properties:
       to 63 Unicode characters or 128 bytes, whichever is smaller. Labels and values
       can contain only lowercase letters, numerals, underscores, and dashes. Keys
       must begin with a letter.
+  - !ruby/object:Api::Type::Enum
+    name: severity
+    description: |
+      The severity of an alert policy indicates how important incidents generated
+      by that policy are. The severity level will be displayed on the Incident
+      detail page and in notifications.
+    values:
+      - :CRITICAL
+      - :ERROR
+      - :WARNING
   - !ruby/object:Api::Type::NestedObject
     name: documentation
     description: |

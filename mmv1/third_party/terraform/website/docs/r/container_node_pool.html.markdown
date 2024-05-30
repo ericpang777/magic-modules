@@ -4,7 +4,7 @@ description: |-
   Manages a GKE NodePool resource.
 ---
 
-# google\_container\_node\_pool
+# google_container_node_pool
 
 -> See the [Using GKE with Terraform](/docs/providers/google/guides/using_gke_with_terraform.html)
 guide for more information about using GKE with Terraform.
@@ -172,7 +172,7 @@ cluster.
 * `placement_policy` - (Optional) Specifies a custom placement policy for the
   nodes.
 
-* `queued_provisioning` - (Optional, Beta) Specifies node pool-level settings of queued provisioning.
+* `queued_provisioning` - (Optional) Specifies node pool-level settings of queued provisioning.
     Structure is [documented below](#nested_queued_provisioning).
 
 <a name="nested_autoscaling"></a>The `autoscaling` block supports (either total or per zone limits are required):

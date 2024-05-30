@@ -143,13 +143,13 @@ func BootstrapKMSKeyWithPurposeInLocationAndName(t *testing.T, purpose, location
 	}
 }
 
-var serviceAccountEmail = "tf-bootstrap-service-account"
+var serviceAccountPrefix = "tf-bootstrap-sa-"
 var serviceAccountDisplay = "Bootstrapped Service Account for Terraform tests"
 
 // Some tests need a second service account, other than the test runner, to assert functionality on.
 // This provides a well-known service account that can be used when dynamically creating a service
 // account isn't an option.
-func getOrCreateServiceAccount(config *transport_tpg.Config, project string) (*iam.ServiceAccount, error) {
+func getOrCreateServiceAccount(config *transport_tpg.Config, project, serviceAccountEmail string) (*iam.ServiceAccount, error) {
 	name := fmt.Sprintf("projects/%s/serviceAccounts/%s@%s.iam.gserviceaccount.com", project, serviceAccountEmail, project)
 	log.Printf("[DEBUG] Verifying %s as bootstrapped service account.\n", name)
 
@@ -206,13 +206,19 @@ func impersonationServiceAccountPermissions(config *transport_tpg.Config, sa *ia
 	return nil
 }
 
-func BootstrapServiceAccount(t *testing.T, project, testRunner string) string {
+// A separate testId should be used for each test, to create separate service accounts for each,
+// and avoid race conditions where the policy of the same service account is being modified by 2
+// tests at once. This is needed as long as the function overwrites the policy on every run.
+func BootstrapServiceAccount(t *testing.T, testId, testRunner string) string {
+	project := envvar.GetTestProjectFromEnv()
+	serviceAccountEmail := serviceAccountPrefix + testId
+
 	config := BootstrapConfig(t)
 	if config == nil {
 		return ""
 	}
 
-	sa, err := getOrCreateServiceAccount(config, project)
+	sa, err := getOrCreateServiceAccount(config, project, serviceAccountEmail)
 	if err != nil {
 		t.Fatalf("Bootstrapping failed. Cannot retrieve service account, %s", err)
 	}
@@ -387,10 +393,9 @@ const SharedTestGlobalAddressPrefix = "tf-bootstrap-addr-"
 // params are the functions to set compute global address
 func BootstrapSharedTestGlobalAddress(t *testing.T, testId string, params ...func(*AddressSettings)) string {
 	project := envvar.GetTestProjectFromEnv()
-	projectNumber := envvar.GetTestProjectNumberFromEnv()
 	addressName := SharedTestGlobalAddressPrefix + testId
 	networkName := BootstrapSharedTestNetwork(t, testId)
-	networkId := fmt.Sprintf("projects/%v/global/networks/%v", projectNumber, networkName)
+	networkId := fmt.Sprintf("projects/%v/global/networks/%v", project, networkName)
 
 	config := BootstrapConfig(t)
 	if config == nil {
@@ -443,6 +448,35 @@ func BootstrapSharedTestGlobalAddress(t *testing.T, testId string, params ...fun
 	return address.Name
 }
 
+type ServiceNetworkSettings struct {
+	PrefixLength  int
+	ParentService string
+}
+
+func ServiceNetworkWithPrefixLength(prefixLength int) func(*ServiceNetworkSettings) {
+	return func(settings *ServiceNetworkSettings) {
+		settings.PrefixLength = prefixLength
+	}
+}
+
+func ServiceNetworkWithParentService(parentService string) func(*ServiceNetworkSettings) {
+	return func(settings *ServiceNetworkSettings) {
+		settings.ParentService = parentService
+	}
+}
+
+func NewServiceNetworkSettings(options ...func(*ServiceNetworkSettings)) *ServiceNetworkSettings {
+	settings := &ServiceNetworkSettings{
+		PrefixLength:  16,                                 // default prefix length
+		ParentService: "servicenetworking.googleapis.com", // default parent service
+	}
+
+	for _, o := range options {
+		o(settings)
+	}
+	return settings
+}
+
 // BootstrapSharedServiceNetworkingConnection will create a shared network
 // if it hasn't been created in the test project, a global address
 // if it hasn't been created in the test project, and a service networking connection
@@ -461,8 +495,9 @@ func BootstrapSharedTestGlobalAddress(t *testing.T, testId string, params ...fun
 // https://cloud.google.com/vpc/docs/configure-private-services-access#removing-connection
 //
 // testId specifies the test for which a shared network and a gobal address are used/initialized.
-func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, params ...func(*AddressSettings)) string {
-	parentService := "services/servicenetworking.googleapis.com"
+func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, params ...func(*ServiceNetworkSettings)) string {
+	settings := NewServiceNetworkSettings(params...)
+	parentService := "services/" + settings.ParentService
 	projectId := envvar.GetTestProjectFromEnv()
 
 	config := BootstrapConfig(t)
@@ -479,7 +514,7 @@ func BootstrapSharedServiceNetworkingConnection(t *testing.T, testId string, par
 
 	networkName := SharedTestNetworkPrefix + testId
 	networkId := fmt.Sprintf("projects/%v/global/networks/%v", project.ProjectNumber, networkName)
-	globalAddressName := BootstrapSharedTestGlobalAddress(t, testId, params...)
+	globalAddressName := BootstrapSharedTestGlobalAddress(t, testId, AddressWithPrefixLength(settings.PrefixLength))
 
 	readCall := config.NewServiceNetworkingClient(config.UserAgent).Services.Connections.List(parentService).Network(networkId)
 	if config.UserProjectOverride {
@@ -579,65 +614,6 @@ func BootstrapServicePerimeterProjects(t *testing.T, desiredProjects int) []*clo
 	}
 
 	return projects
-}
-
-func RemoveContainerServiceAgentRoleFromContainerEngineRobot(t *testing.T, project *cloudresourcemanager.Project) {
-	config := BootstrapConfig(t)
-	if config == nil {
-		return
-	}
-
-	client := config.NewResourceManagerClient(config.UserAgent)
-	containerEngineRobot := fmt.Sprintf("serviceAccount:service-%d@container-engine-robot.iam.gserviceaccount.com", project.ProjectNumber)
-	getPolicyRequest := &cloudresourcemanager.GetIamPolicyRequest{}
-	policy, err := client.Projects.GetIamPolicy(project.ProjectId, getPolicyRequest).Do()
-	if err != nil {
-		t.Fatalf("error getting project iam policy: %v", err)
-	}
-	roleFound := false
-	changed := false
-	for _, binding := range policy.Bindings {
-		if binding.Role == "roles/container.serviceAgent" {
-			memberFound := false
-			for i, member := range binding.Members {
-				if member == containerEngineRobot {
-					binding.Members[i] = binding.Members[len(binding.Members)-1]
-					memberFound = true
-				}
-			}
-			if memberFound {
-				binding.Members = binding.Members[:len(binding.Members)-1]
-				changed = true
-			}
-		} else if binding.Role == "roles/editor" {
-			memberFound := false
-			for _, member := range binding.Members {
-				if member == containerEngineRobot {
-					memberFound = true
-					break
-				}
-			}
-			if !memberFound {
-				binding.Members = append(binding.Members, containerEngineRobot)
-				changed = true
-			}
-			roleFound = true
-		}
-	}
-	if !roleFound {
-		policy.Bindings = append(policy.Bindings, &cloudresourcemanager.Binding{
-			Members: []string{containerEngineRobot},
-			Role:    "roles/editor",
-		})
-		changed = true
-	}
-	if changed {
-		setPolicyRequest := &cloudresourcemanager.SetIamPolicyRequest{Policy: policy}
-		policy, err = client.Projects.SetIamPolicy(project.ProjectId, setPolicyRequest).Do()
-		if err != nil {
-			t.Fatalf("error setting project iam policy: %v", err)
-		}
-	}
 }
 
 // BootstrapProject will create or get a project named
@@ -1258,7 +1234,8 @@ func SetupProjectsAndGetAccessToken(org, billing, pid, service string, config *t
 	}
 
 	// Create a service account for project-1
-	sa1, err := getOrCreateServiceAccount(config, pid)
+	serviceAccountEmail := serviceAccountPrefix + service
+	sa1, err := getOrCreateServiceAccount(config, pid, serviceAccountEmail)
 	if err != nil {
 		return "", err
 	}

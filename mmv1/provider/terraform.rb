@@ -18,12 +18,12 @@ require 'google/logger'
 require 'json'
 require 'provider/file_template'
 require 'provider/terraform/async'
-require 'provider/terraform/config'
 require 'provider/terraform/import'
 require 'provider/terraform/custom_code'
 require 'provider/terraform/docs'
 require 'provider/terraform/examples'
 require 'provider/terraform/sub_template'
+require 'provider/terraform/sweeper'
 require 'google/golang_utils'
 
 module Provider
@@ -35,6 +35,10 @@ module Provider
     include Provider::Terraform::SubTemplate
     include Google::GolangUtils
 
+    attr_accessor :resource_count
+    attr_accessor :iam_resource_count
+    attr_accessor :resources_for_version
+
     TERRAFORM_PROVIDER_GA = 'github.com/hashicorp/terraform-provider-google'.freeze
     TERRAFORM_PROVIDER_BETA = 'github.com/hashicorp/terraform-provider-google-beta'.freeze
     TERRAFORM_PROVIDER_PRIVATE = 'internal/terraform-next'.freeze
@@ -42,8 +46,7 @@ module Provider
     RESOURCE_DIRECTORY_BETA = 'google-beta'.freeze
     RESOURCE_DIRECTORY_PRIVATE = 'google-private'.freeze
 
-    def initialize(config, api, version_name, start_time)
-      @config = config
+    def initialize(api, version_name, start_time)
       @api = api
 
       # @target_version_name is the version specified by MM for this generation
@@ -64,6 +67,10 @@ module Provider
       # use the time the file was modified.
       @start_time = start_time
       @go_format_enabled = check_goformat
+
+      @resource_count = 0
+      @iam_resource_count = 0
+      @resources_for_version = []
     end
 
     # This provides the ProductFileTemplate class with access to a provider.
@@ -84,15 +91,6 @@ module Provider
     # Main entry point for generation.
     def generate(output_folder, types, product_path, dump_yaml, generate_code, generate_docs)
       generate_objects(output_folder, types, generate_code, generate_docs)
-
-      # Compilation has to be the last step, as some files (e.g.
-      # CONTRIBUTING.md) may depend on the list of all files previously copied
-      # or compiled.
-      # common-compile.yaml is a special file that will get compiled by the last product
-      # used in a single invocation of the compiled. It should not contain product-specific
-      # information; instead, it should be run-specific such as the version to compile at.
-      compile_product_files(output_folder) \
-        unless @config.files.nil? || @config.files.compile.nil?
 
       FileUtils.mkpath output_folder
       pwd = Dir.pwd
@@ -159,18 +157,6 @@ module Provider
       end.map(&:join)
     end
 
-    # Compiles files specified within the product
-    def compile_product_files(output_folder)
-      file_template = ProductFileTemplate.new(
-        output_folder,
-        nil,
-        @api,
-        @target_version_name,
-        build_env
-      )
-      compile_file_list(output_folder, @config.files.compile, file_template)
-    end
-
     # Compiles files that are shared at the provider level
     def compile_common_files(
       output_folder,
@@ -179,6 +165,8 @@ module Provider
       override_path = nil
     )
       return unless File.exist?(common_compile_file)
+
+      generate_resources_for_version(products, @target_version_name)
 
       files = YAML.safe_load(compile(common_compile_file))
       return unless files
@@ -344,6 +332,32 @@ module Provider
       end
     end
 
+    # Gets the list of services dependent on the version ga, beta, and private
+    # If there are some resources of a servcie is in GA,
+    # then this service is in GA. Otherwise, the service is in BETA
+    def get_mmv1_services_in_version(products, version)
+      services = []
+      products.map do |product|
+        product_definition = product[:definitions]
+        if version == 'ga'
+          some_resource_in_ga = false
+          product_definition.objects.each do |object|
+            break if some_resource_in_ga
+
+            if !object.exclude &&
+               !object.not_in_version?(product_definition.version_obj_or_closest(version))
+              some_resource_in_ga = true
+            end
+          end
+
+          services << product[:definitions].name.downcase if some_resource_in_ga
+        else
+          services << product[:definitions].name.downcase
+        end
+      end
+      services
+    end
+
     def generate_objects(output_folder, types, generate_code, generate_docs)
       (@api.objects || []).each do |object|
         if !types.empty? && !types.include?(object.name)
@@ -364,6 +378,8 @@ module Provider
 
           generate_object object, output_folder, @target_version_name, generate_code, generate_docs
         end
+        # Uncomment for go YAML
+        # generate_object_modified object, output_folder, @target_version_name
       end
     end
 
@@ -382,7 +398,6 @@ module Provider
         end
         Dir.chdir pwd
       end
-
       # if iam_policy is not defined or excluded, don't generate it
       return if object.iam_policy.nil? || object.iam_policy.exclude
 
@@ -391,6 +406,33 @@ module Provider
       Google::LOGGER.debug "Generating #{object.name} IAM policy"
       generate_iam_policy(pwd, data.clone, generate_code, generate_docs)
       Dir.chdir pwd
+    end
+
+    def generate_object_modified(object, output_folder, version_name)
+      pwd = Dir.pwd
+      data = build_object_data(pwd, object, output_folder, version_name)
+      FileUtils.mkpath output_folder
+      Dir.chdir output_folder
+      Google::LOGGER.debug "Generating #{object.name} rewrite yaml"
+      generate_newyaml(pwd, data.clone)
+      Dir.chdir pwd
+    end
+
+    def generate_newyaml(pwd, data)
+      # @api.api_name is the service folder name
+      product_name = @api.api_name
+      target_folder = File.join(folder_name(data.version), 'services', product_name)
+      FileUtils.mkpath target_folder
+      data.generate(pwd,
+                    '/templates/terraform/yaml_conversion.erb',
+                    "#{target_folder}/go_#{data.object.name}.yaml",
+                    self)
+      return if File.exist?("#{target_folder}/go_product.yaml")
+
+      data.generate(pwd,
+                    '/templates/terraform/product_yaml_conversion.erb',
+                    "#{target_folder}/go_product.yaml",
+                    self)
     end
 
     def build_env
@@ -422,14 +464,6 @@ module Provider
           update_id: p.update_id,
           fingerprint_name: p.fingerprint_name
         }
-      end
-    end
-
-    # Filter the properties to keep only the ones don't have custom update
-    # method and group them by update url & verb.
-    def properties_without_custom_update(properties)
-      properties.select do |p|
-        p.update_url.nil? || p.update_verb.nil? || p.update_verb == :NOOP
       end
     end
 
@@ -532,13 +566,21 @@ module Provider
     end
 
     def force_new?(property, resource)
-      ((!property.output || property.is_a?(Api::Type::KeyValueEffectiveLabels)) &&
-        (property.immutable || (resource.immutable && property.update_url.nil? &&
-                              property.immutable.nil? &&
-                            (property.parent.nil? ||
-                             force_new?(property.parent, resource))))) ||
+      (
+        (!property.output || property.is_a?(Api::Type::KeyValueEffectiveLabels)) &&
+        (property.immutable ||
+          (resource.immutable && property.update_url.nil? && property.immutable.nil? &&
+            (property.parent.nil? ||
+              (force_new?(property.parent, resource) &&
+               !(property.parent.flatten_object && property.is_a?(Api::Type::KeyValueLabels))
+              )
+            )
+          )
+        )
+      ) ||
         (property.is_a?(Api::Type::KeyValueTerraformLabels) &&
-          !updatable?(resource, resource.all_user_properties))
+          !updatable?(resource, resource.all_user_properties) && !resource.root_labels?
+        )
     end
 
     # Returns tuples of (fieldName, list of update masks) for
@@ -615,30 +657,57 @@ module Provider
       property.name.camelize(:upper)
     end
 
+    # Generates the list of resources, and gets the count of resources and iam resources
+    # dependent on the version ga, beta or private.
+    # The resource object has the format
+    # {
+    #    terraform_name:
+    #    resource_name:
+    #    iam_class_name:
+    # }
+    # The variable resources_for_version is used to generate resources in file
+    # mmv1/third_party/terraform/provider/provider_mmv1_resources.go.erb
+    def generate_resources_for_version(products, version)
+      products.each do |product|
+        product_definition = product[:definitions]
+        service = product_definition.name.downcase
+        product_definition.objects.each do |object|
+          if object.exclude ||
+             object.not_in_version?(product_definition.version_obj_or_closest(version))
+            next
+          end
+
+          @resource_count += 1 unless object&.exclude_resource
+
+          tf_product = (object.__product.legacy_name || product_definition.name).underscore
+          terraform_name = object.legacy_name || "google_#{tf_product}_#{object.name.underscore}"
+
+          unless object&.exclude_resource
+            resource_name = "#{service}.Resource#{product_definition.name}#{object.name}"
+          end
+
+          iam_policy = object&.iam_policy
+
+          @iam_resource_count += 3 unless iam_policy.nil? || iam_policy.exclude
+
+          unless iam_policy.nil? || iam_policy.exclude ||
+                 (iam_policy.min_version && iam_policy.min_version < version)
+            iam_class_name = "#{service}.#{product_definition.name}#{object.name}"
+          end
+
+          @resources_for_version << { terraform_name:, resource_name:, iam_class_name: }
+        end
+      end
+
+      @resources_for_version = @resources_for_version.compact
+    end
+
     # TODO(nelsonjr): Review all object interfaces and move to private methods
     # that should not be exposed outside the object hierarchy.
     private
 
-    def generate_requires(properties, requires = [])
-      requires.concat(properties.collect(&:requires))
-    end
-
     def provider_name
       self.class.name.split('::').last.downcase
-    end
-
-    # Determines the copyright year. If the file already exists we'll attempt to
-    # recognize the copyright year, and if it finds it will keep it.
-    def effective_copyright_year(out_file)
-      copyright_mask = /# Copyright (?<year>[0-9-]*) Google Inc./
-      if File.exist?(out_file)
-        first_line = File.read(out_file).split("\n")
-                         .select { |l| copyright_mask.match(l) }
-                         .first
-        matcher = copyright_mask.match(first_line)
-        return matcher[:year] unless matcher.nil?
-      end
-      Time.now.year
     end
 
     # Adapted from the method used in templating
@@ -811,7 +880,6 @@ module Provider
         output_folder,
         object,
         version,
-        @config,
         build_env
       )
     end
